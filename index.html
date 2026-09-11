@@ -328,7 +328,8 @@ textarea.csv{
   border:1.5px solid var(--ink);border-radius:4px;padding:9px 11px;background:var(--panel);
   display:flex;gap:11px;align-items:center;
 }
-.tagpreview .qr{width:56px;height:56px;flex-shrink:0;background:var(--panel)}
+.tagpreview .qr{width:64px;height:64px;flex-shrink:0;background:#fff;border-radius:2px}
+.tagpreview .qr svg{display:block;width:100%;height:100%}
 .tagpreview .txt{font-family:"IBM Plex Mono",monospace;line-height:1.35;min-width:0}
 .tagpreview .txt b{font-size:14px;font-weight:600;display:block;letter-spacing:-.02em}
 .tagpreview .txt span{font-size:10.5px;color:var(--muted);display:block}
@@ -346,6 +347,46 @@ textarea.csv{
 .askbox p{margin:0;font-size:15px;line-height:1.4;color:var(--ink)}
 .askbox .row{gap:9px}
 .askbox .btn{flex:1}
+
+/* ---------- scanner ---------- */
+.scanbox{
+  position:relative;width:100%;aspect-ratio:1/1;border-radius:6px;overflow:hidden;
+  background:#0B0D0A;border:1px solid var(--line-strong);
+}
+.scanbox video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.scanframe{
+  position:absolute;inset:16%;border:2px solid rgba(255,255,255,.85);border-radius:8px;
+  box-shadow:0 0 0 999px rgba(0,0,0,.28);pointer-events:none;
+}
+.scanmsg{
+  font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--muted);
+  margin:0;text-align:center;
+}
+.btnrow{display:flex;gap:9px}
+.btnrow .btn{flex:1}
+
+/* ---------- printable tags (always black on white: it is a physical label) ---------- */
+.sheet{display:grid;grid-template-columns:repeat(auto-fill,2.6in);gap:.14in;justify-content:center}
+.ptag{
+  width:2.6in;height:1.3in;background:#fff;color:#000;border:1px solid #000;border-radius:3px;
+  display:flex;align-items:center;gap:.09in;padding:.08in .1in;overflow:hidden;
+  break-inside:avoid;page-break-inside:avoid;
+}
+.ptag .qr{width:1.1in;height:1.1in;flex-shrink:0}
+.ptag .qr svg{display:block;width:100%;height:100%}
+.ptag .txt{display:flex;flex-direction:column;gap:.02in;min-width:0;font-family:"IBM Plex Mono",monospace;line-height:1.2}
+.ptag .txt b{font-size:10.5pt;font-weight:600;letter-spacing:-.02em;word-break:break-all}
+.ptag .txt span{font-size:7pt;text-transform:uppercase;letter-spacing:.02em}
+.ptag .txt .brand{font-family:"Barlow Semi Condensed",sans-serif;font-weight:700;font-size:7.5pt;letter-spacing:.08em}
+
+@media print{
+  @page{margin:.4in}
+  html,body{background:#fff !important;overflow:visible !important}
+  .app,.tabbar,.toast,#ask-root,.ovbar,.ovfoot,.noprint{display:none !important}
+  .overlay{position:static !important;inset:auto !important;max-width:none !important;
+           border:none !important;background:#fff !important;display:block !important}
+  .ovbody{overflow:visible !important;padding:0 !important}
+}
 </style>
 
 <div class="app">
@@ -364,6 +405,11 @@ textarea.csv{
 <div id="overlay-root"></div>
 <div id="ask-root"></div>
 <input type="file" id="restoreinput" accept="application/json,.json" hidden>
+<input type="file" id="scanphotoinput" accept="image/*" hidden>
+
+<!-- QR drawing and QR reading. Loaded up front so the scanner still works after you lose signal. -->
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 
 <script>
 "use strict";
@@ -377,11 +423,14 @@ const AVG_TIMEOUT = 22000;
 const SPLICE_TYPES = ["Splice","Flange end"];
 const PIPE_SIZES = ['2.375"','3"','3.5"','4"','4.5"','5"','5.5"','6"'];
 const MATERIALS = ["Stainless steel","Zinc chromate"];
+// suggestions only: the fields accept anything, since fitting sizes and ratings vary by customer
+const FIT_SIZES = ['2"','2.5"','3"','4"','5"','6"','8"'];
+const FIT_CLASSES = ["150#","300#","600#","900#","1500#","2500#","API 2000","API 3000","API 5000"];
 const MAX_PHOTOS = 12;
 
 /* ============ storage ============ */
 const DEFAULTS = {
-  settings:{ job:"", crew:"A", tech:"" },
+  settings:{ job:"", crew:"A", tech:"", tagBase:"" },
   records:[], seq:{}
 };
 let db = load();
@@ -400,7 +449,11 @@ function load(){
 }
 function save(){
   try{ localStorage.setItem(KEY, JSON.stringify(db)); }
-  catch(e){ toast("Storage full — remove some photos"); }
+  catch(e){
+    const full = e && (e.name === "QuotaExceededError" || e.code === 22);
+    toast(full ? "Storage full — remove some photos or export a backup"
+               : "This browser won't let the page save — records vanish when it closes");
+  }
 }
 
 /* ============ helpers ============ */
@@ -436,6 +489,90 @@ function fmtDate(iso){
          d.toLocaleTimeString(undefined,{hour:"numeric",minute:"2-digit"});
 }
 function fmtCoord(n){ return n==null ? "—" : n.toFixed(6); }
+const isInstalled = r => !!(r && r.pos);
+
+/* IDs are JOB-CREW-NNNN; the job itself may contain dashes. */
+function idParts(id){
+  const p = String(id||"").split("-");
+  if(p.length < 3) return null;
+  return { job:p.slice(0,-2).join("-"), crew:p[p.length-2], seq:parseInt(p[p.length-1],10), key:p.slice(0,-1).join("-") };
+}
+function jobOf(r){ return r.job || (idParts(r.id)||{}).job || db.settings.job || ""; }
+/* A tag made on another device must never be re-issued by this one. */
+function bumpSeq(id){
+  const p = idParts(id);
+  if(p && isFinite(p.seq) && (db.seq[p.key]||0) < p.seq) db.seq[p.key] = p.seq;
+}
+
+/* ---------- tag codes ----------
+   The QR carries the shop details itself, so a phone that has never seen the record
+   can still fill it in: there is no server between the shop and the field.
+   Format: <site address>#t=1~ID~S|F~SIZE~SS|ZC~REEL~SWAGE~INSERT[~PARTNO~FITSIZE~CLASS~BORE] */
+function defaultBase(){
+  if(location.protocol !== "https:") return "";
+  return location.origin + location.pathname.replace(/index\.html$/i, "");
+}
+function tagBase(){ return String(db.settings.tagBase || defaultBase()).trim(); }
+
+function tagContent(r){
+  const enc = v => encodeURIComponent(String(v==null?"":v).replace(/~/g,"-"));
+  const flange = r.type === "Flange end";
+  const fields = ["1", r.id, flange?"F":"S", String(r.size||"").replace(/"/g,""),
+                  r.material==="Zinc chromate"?"ZC":"SS", r.reel, r.swage, flange?r.insert:"",
+                  r.fitId, r.fitSize, r.fitClass, r.fitBore];
+  // trailing empties add nothing but separators, and a smaller code scans more easily
+  while(fields.length > 8 && !fields[fields.length-1]) fields.pop();
+  return tagBase() + "#t=" + fields.map(enc).join("~");
+}
+
+/* Accepts a full tag link, a bare "#t=..." payload, or a plain ID from an older tag. */
+function parseTag(text){
+  const s = String(text||"").trim();
+  const m = s.match(/(?:^|[#&?])t=([^&#\s]*)/);
+  if(!m) return s && /^[A-Za-z0-9._-]+$/.test(s) ? { id:s, bare:true } : null;
+  const f = m[1].split("~").map(x=>{ try{ return decodeURIComponent(x); }catch(e){ return x; } });
+  if(f[0] !== "1" || !f[1]) return null;
+  const type = f[2] === "F" ? "Flange end" : "Splice";
+  return {
+    id:f[1], type,
+    size: f[3] ? f[3] + '"' : PIPE_SIZES[0],
+    material: f[4] === "ZC" ? "Zinc chromate" : "Stainless steel",
+    reel:f[5]||"", swage:f[6]||"", insert: type==="Flange end" ? (f[7]||"") : "",
+    // added later; tags printed before these existed simply leave them blank
+    fitId:f[8]||"", fitSize:f[9]||"", fitClass:f[10]||"", fitBore:f[11]||""
+  };
+}
+
+/* Real QR as SVG (quiet zone included). Null when the library did not load. */
+function qrSvg(text){
+  if(typeof qrcode !== "function") return null;
+  try{
+    const q = qrcode(0, "Q");                 // Q recovers ~25% damage: tags get scuffed
+    q.addData(text); q.make();
+    const n = q.getModuleCount(), m = 3, s = n + m*2;
+    let d = "";
+    for(let y=0;y<n;y++) for(let x=0;x<n;x++) if(q.isDark(y,x)) d += `M${x+m} ${y+m}h1v1h-1z`;
+    return `<svg viewBox="0 0 ${s} ${s}" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" role="img" aria-label="QR code"><rect width="${s}" height="${s}" fill="#fff"/><path d="${d}" fill="#000"/></svg>`;
+  }catch(e){ return null; }
+}
+function qrOrNote(text){
+  return qrSvg(text) || `<div style="font:10px/1.3 monospace;color:#000;padding:4px">QR unavailable — reload with signal</div>`;
+}
+
+/* Coupling/flange rows for a <dl class="kv">; omitted entirely when none were entered. */
+function fittingRows(r){
+  if(!(r.fitId || r.fitSize || r.fitClass || r.fitBore)) return "";
+  const word = r.type === "Flange end" ? "Flange" : "Coupling";
+  return `<dt>${word} no.</dt><dd>${esc(r.fitId)||"—"}</dd>
+          <dt>${word} size</dt><dd>${esc(r.fitSize)||"—"}${r.fitClass?" · "+esc(r.fitClass):""}</dd>
+          <dt>Inside dia.</dt><dd>${r.fitBore?esc(r.fitBore)+" in":"—"}</dd>`;
+}
+
+function specLine(r){
+  return [r.type, r.size, r.material,
+          r.swage ? `swage ${r.swage}"` : "",
+          r.type==="Flange end" && r.insert ? `insert ${r.insert}"` : ""].filter(Boolean).join(" · ");
+}
 
 const ICON = {
   pin:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11z"/><circle cx="12" cy="10" r="2.6"/></svg>',
@@ -446,11 +583,14 @@ const ICON = {
   warn:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 22 20H2z"/><path d="M12 9.5v5M12 17.4v.1"/></svg>',
   check:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>',
   sat:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.4"/><path d="M12 5.6a6.4 6.4 0 0 1 6.4 6.4M12 2.2A9.8 9.8 0 0 1 21.8 12"/><path d="M12 18.4A6.4 6.4 0 0 1 5.6 12M12 21.8A9.8 9.8 0 0 1 2.2 12"/></svg>',
-  cloud:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4 4 0 0 1-.4-8A5.5 5.5 0 0 1 17.2 9 3.8 3.8 0 0 1 17.5 18z"/><path d="M12 11.5v6M9.4 15l2.6 2.6 2.6-2.6"/></svg>'
+  cloud:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4 4 0 0 1-.4-8A5.5 5.5 0 0 1 17.2 9 3.8 3.8 0 0 1 17.5 18z"/><path d="M12 11.5v6M9.4 15l2.6 2.6 2.6-2.6"/></svg>',
+  scan:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 9h3v3H8zM13 13h3v3h-3zM13 9h3M8 15h3"/></svg>',
+  print:'<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M7 9V4h10v5"/><rect x="3.5" y="9" width="17" height="8" rx="1.5"/><path d="M7 14h10v6H7z"/></svg>'
 };
 
 /* ============ app state ============ */
-let state = { tab:"log", overlay:null, draft:null, gps:null, watchId:null, here:null };
+let state = { tab:"log", overlay:null, draft:null, gps:null, watchId:null, here:null,
+              scanErr:null, scanId:"" };
 
 /* ============ geolocation ============ */
 function startWatch(){
@@ -571,32 +711,37 @@ function renderTabs(){
 
 /* ============ render: log tab ============ */
 function viewLog(){
-  const recs = [...db.records].sort((a,b)=> b.at.localeCompare(a.at));
+  const recs = db.records.filter(isInstalled).sort((a,b)=> b.at.localeCompare(a.at));
+  const waiting = db.records.filter(r=>!isInstalled(r)).length;
   const pend = recs.filter(r=>r.sync==="pending").length;
   const ready = !!db.settings.job;
 
   let html = `
-    <div class="spread">
-      <div>
-        <div class="eyebrow">Field log</div>
-        <h2>${recs.length} record${recs.length===1?"":"s"}</h2>
-      </div>
-      <button class="btn primary sm" data-act="new" ${ready?"":"disabled"}>${ICON.plus} New</button>
+    <div>
+      <div class="eyebrow">Field log</div>
+      <h2>${recs.length} installed</h2>
+    </div>
+    <div class="btnrow">
+      <button class="btn primary" data-act="scan">${ICON.scan} Scan tag</button>
+      <button class="btn" data-act="new" ${ready?"":"disabled"}>${ICON.plus} No tag</button>
     </div>`;
 
   if(!ready){
     html += `<div class="card card-pad stack">
       <div class="eyebrow">First run</div>
-      <p style="margin:0;font-size:14.5px;color:var(--ink-2)">Set a job number and crew letter before logging anything. Together they build the ID that every record and printed tag carries.</p>
-      <button class="btn primary wide" data-act="gosetup">${ICON.gear} Open setup</button>
+      <p style="margin:0;font-size:14.5px;color:var(--ink-2)">Scanning a tag prepared in the shop works right away — the code carries its own details. To log a joint without a tag, or to prepare tags, set a job number and crew letter first.</p>
+      <button class="btn wide" data-act="gosetup">${ICON.gear} Open setup</button>
     </div>`;
-    return html;
+  }
+
+  if(waiting){
+    html += `<div class="notice ok">${ICON.tag}<div><b>${waiting} prepared tag${waiting===1?"":"s"} on this device waiting to be installed.</b>
+      Scan the tag at the joint to fill in the position and photos.</div></div>`;
   }
 
   if(!recs.length){
-    html += `<div class="card card-pad empty">${ICON.pin}
-      <p>Nothing logged yet. Stand at the splice and tap <b>New</b> — it captures the position first, then the details.</p>
-      <button class="btn primary" data-act="new">${ICON.plus} Log first splice</button>
+    html += `<div class="card card-pad empty">${ICON.scan}
+      <p>Nothing installed yet. At the joint, tap <b>Scan tag</b> and point the camera at the code — the shop details load, and you add the position and photos.</p>
     </div>`;
     return html;
   }
@@ -656,7 +801,7 @@ function drawPlot(){
   g.setTransform(dpr,0,0,dpr,0,0);
   g.clearRect(0,0,w,h);
 
-  const pts = db.records.map(r=>({lat:r.pos.lat, lon:r.pos.lon, sync:r.sync, me:false}));
+  const pts = db.records.filter(isInstalled).map(r=>({lat:r.pos.lat, lon:r.pos.lon, sync:r.sync, me:false}));
   if(state.here) pts.push({lat:state.here.lat, lon:state.here.lon, me:true});
   if(!pts.length) return;
 
@@ -710,92 +855,91 @@ function drawPlot(){
 
 /* ============ render: tags tab ============ */
 function viewTags(){
-  const unprinted = db.records.filter(r=>!r.tagPrinted);
-  const printed = db.records.filter(r=>r.tagPrinted && !r.tagApplied);
-  const applied = db.records.filter(r=>r.tagApplied);
+  const ready = !!db.settings.job;
+  const queue    = db.records.filter(r=>!r.tagPrinted);
+  const outbound = db.records.filter(r=>r.tagPrinted && !isInstalled(r));
+  const loose    = db.records.filter(r=>r.tagPrinted && isInstalled(r) && !r.tagApplied);
+  const done     = db.records.filter(r=>isInstalled(r) && r.tagApplied);
 
   let html = `
     <div>
-      <div class="eyebrow">Back at the office</div>
-      <h2>Tag queue</h2>
+      <div class="eyebrow">Shop</div>
+      <h2>Tags</h2>
     </div>
-    <div class="notice ok">${ICON.check}<div>Tags are printed <b>after</b> the fact. Records come back from the field with IDs already assigned — you batch-print the ones that still need a tag.</div></div>`;
-
-  html += `<div class="card">
-    <div class="card-pad" style="border-bottom:1px solid var(--line)">
-      <div class="spread">
-        <h3>Needs a tag · ${unprinted.length}</h3>
-        ${unprinted.length?`<button class="btn sm" data-act="selall">Select all</button>`:""}
-      </div>
+    <div class="card card-pad stack">
+      <p style="margin:0;font-size:14.5px;color:var(--ink-2)">Enter the fitting details here before it ships. The printed code carries them, so in the field the crew only scans, captures the position, and adds photos.</p>
+      <button class="btn primary wide" data-act="prep" ${ready?"":"disabled"}>${ICON.plus} Prepare tags</button>
+      ${ready ? "" : `<p class="hint" style="margin:0;font-size:13px;color:var(--muted)">Set a job number in Setup first — it goes into every tag ID.</p>`}
     </div>`;
 
-  if(!unprinted.length){
-    html += `<div class="card-pad empty" style="padding:22px">${ICON.tag}<p>Every record has a tag printed. Nothing waiting.</p></div>`;
+  html += `<div class="card">
+    <div class="card-pad spread" style="border-bottom:1px solid var(--line)">
+      <h3>Print queue · ${queue.length}</h3>
+      ${queue.length?`<button class="btn sm" data-act="selall">Select all</button>`:""}
+    </div>`;
+  if(!queue.length){
+    html += `<div class="card-pad empty" style="padding:22px">${ICON.tag}<p>Nothing waiting to print.</p></div>`;
   }else{
-    html += unprinted.map(r=>`
+    html += queue.map(r=>`
       <label class="tagrow">
         <input type="checkbox" class="tagpick" value="${esc(r.id)}">
-        <span class="who"><b>${esc(r.id)}</b><span>${esc(r.type)} · ${esc(r.size)} · ${fmtDate(r.at)}</span></span>
+        <span class="who"><b>${esc(r.id)}</b><span>${esc(specLine(r))}</span></span>
+        <span class="pill ${isInstalled(r)?"ok":"mute"}">${isInstalled(r)?"Installed":"Prepared"}</span>
       </label>`).join("");
-    html += `<div class="card-pad" style="border-top:1px solid var(--line)">
-      <button class="btn primary wide" data-act="makecsv">Build print file</button>
+    html += `<div class="card-pad btnrow" style="border-top:1px solid var(--line)">
+      <button class="btn primary" data-act="printsheet">${ICON.print} Print tags</button>
+      <button class="btn" data-act="makecsv">Label file</button>
     </div>`;
   }
   html += `</div>`;
 
-  if(unprinted.length){
-    const r = unprinted[0];
+  if(queue.length){
+    const r = queue[0];
     html += `<div class="card card-pad stack">
       <div class="eyebrow">What gets printed</div>
       <div class="tagpreview">
-        <canvas class="qr" id="qrprev" width="56" height="56"></canvas>
+        <div class="qr">${qrOrNote(tagContent(r))}</div>
         <div class="txt">
           <b>${esc(r.id)}</b>
-          <span>SPECIALTY RTP · ${esc(db.settings.job)}</span>
-          <span>INSTALLED ${new Date(r.at).toLocaleDateString()}</span>
+          <span>${esc(specLine(r))}</span>
+          <span>SPECIALTY RTP · ${esc(jobOf(r))}</span>
         </div>
       </div>
-      <p class="hint" style="font-size:13px;color:var(--muted);margin:0">Code and number both. If the code is scratched off, somebody can still read the ID and look it up.</p>
+      <p class="hint" style="font-size:13px;color:var(--muted);margin:0">Code and number both. If the code gets scratched off, the ID is still readable and can be typed in.</p>
+      ${tagBase() ? "" : `<div class="notice warn">${ICON.warn}<div><b>No site address set.</b> The in-app scanner will read these codes, but a phone's own camera won't open anything. Set the address in Setup before printing real tags.</div></div>`}
     </div>`;
   }
 
-  if(printed.length){
+  if(outbound.length){
     html += `<div class="card">
-      <div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Printed, not yet on the pipe · ${printed.length}</h3></div>
-      ${printed.map(r=>`<div class="tagrow">
+      <div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Printed · waiting for install · ${outbound.length}</h3></div>
+      ${outbound.map(r=>`<button class="tagrow" style="width:100%;text-align:left" data-open="${esc(r.id)}">
+        <span class="who"><b>${esc(r.id)}</b><span>${esc(specLine(r))}</span></span>
+        <span class="pill mute">Out</span>
+      </button>`).join("")}
+    </div>`;
+  }
+
+  if(loose.length){
+    html += `<div class="card">
+      <div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Printed, not yet on the pipe · ${loose.length}</h3></div>
+      ${loose.map(r=>`<div class="tagrow">
         <span class="who"><b>${esc(r.id)}</b><span>Printed ${fmtDate(r.tagPrinted)}</span></span>
         <button class="btn sm" data-applied="${esc(r.id)}">Mark applied</button>
       </div>`).join("")}
     </div>`;
   }
 
-  if(applied.length){
+  if(done.length){
     html += `<div class="card">
-      <div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Tagged in the field · ${applied.length}</h3></div>
-      ${applied.map(r=>`<div class="tagrow">
-        <span class="who"><b>${esc(r.id)}</b><span>Applied ${fmtDate(r.tagApplied)}</span></span>
+      <div class="card-pad" style="border-bottom:1px solid var(--line)"><h3>Installed and tagged · ${done.length}</h3></div>
+      ${done.map(r=>`<button class="tagrow" style="width:100%;text-align:left" data-open="${esc(r.id)}">
+        <span class="who"><b>${esc(r.id)}</b><span>Installed ${fmtDate(r.at)}</span></span>
         <span class="pill ok">Done</span>
-      </div>`).join("")}
+      </button>`).join("")}
     </div>`;
   }
   return html;
-}
-
-/* tiny deterministic block pattern standing in for a real QR symbol */
-function drawQrStub(cv, seed){
-  const g = cv.getContext("2d");
-  const cs = getComputedStyle(document.documentElement);
-  const N = 11, s = cv.width/N;
-  let h = 0; for(let i=0;i<seed.length;i++) h = (h*31 + seed.charCodeAt(i)) >>> 0;
-  g.fillStyle = cs.getPropertyValue("--panel").trim(); g.fillRect(0,0,cv.width,cv.height);
-  g.fillStyle = cs.getPropertyValue("--ink").trim();
-  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
-    const corner = (x<3&&y<3)||(x>N-4&&y<3)||(x<3&&y>N-4);
-    let on;
-    if(corner){ const ex=Math.min(x,N-1-x), ey=Math.min(y,N-1-y); on = (ex===0||ey===0||(ex===2&&ey===2)||(ex>=2&&ey>=2)); }
-    else { h = (h*1103515245 + 12345) >>> 0; on = ((h>>>16) & 1) === 1; }
-    if(on) g.fillRect(x*s, y*s, s+0.5, s+0.5);
-  }
 }
 
 /* ============ render: export tab ============ */
@@ -814,9 +958,11 @@ function viewExport(){
     return html;
   }
 
+  const inst = db.records.filter(isInstalled).length;
   html += `<div class="card card-pad">
     <dl class="readout" style="margin:0">
       <dt>Records</dt><dd>${n}</dd>
+      <dt>Installed</dt><dd>${inst}${n>inst?` · ${n-inst} prepared, no position yet`:""}</dd>
       <dt>Photos</dt><dd>${shots}</dd>
       <dt>Photo data</dt><dd>${mb} MB</dd>
       <dt>Datum</dt><dd>WGS84</dd>
@@ -837,7 +983,7 @@ function viewExport(){
 
   html += `<div class="card card-pad stack">
     <h3>Spreadsheet</h3>
-    <p style="margin:0;font-size:14px;color:var(--ink-2)">One row per record with coordinates, accuracy, and notes. Opens in Excel.</p>
+    <p style="margin:0;font-size:14px;color:var(--ink-2)">One row per record — prepared ones included, with blank coordinates — plus accuracy and notes. Opens in Excel. The map files above only carry installed joints, since a prepared tag has no position yet.</p>
     <button class="btn wide" data-act="csv">Export CSV</button>
   </div>`;
 
@@ -881,8 +1027,19 @@ function viewSetup(){
         ${ s.job
           ? `Next ID on this device: <b class="mono-in">${esc(s.job)}-${esc(s.crew)}-${String((db.seq[s.job+"-"+s.crew]||0)+1).padStart(4,"0")}</b><br>`
           : `<b>Enter a job number to start logging.</b><br>` }
-        The crew letter is what keeps two offline phones from handing out the same number.
+        The crew letter is what keeps two offline phones from handing out the same number. Give the shop computer its own letter too — S, say — so tags it prepares never collide with IDs a field phone creates.
       </p>
+    </div>
+
+    <div class="card card-pad stack">
+      <h3>Tag link address</h3>
+      <div class="field" style="margin:0">
+        <label for="s-base">Site address</label>
+        <input id="s-base" class="mono-in" value="${esc(s.tagBase||"")}" data-set="tagBase"
+               placeholder="${esc(defaultBase() || "https://you.github.io/splice-logger/")}" autocomplete="off" inputmode="url">
+      </div>
+      <p style="margin:0;font-size:14px;color:var(--ink-2)">Printed into every code, so a phone's own camera opens this app. Leave blank to use the address this page is running from${defaultBase()?` — currently <span class="mono-in" style="word-break:break-all">${esc(defaultBase())}</span>`:" (none right now: this copy isn't running from a web address)"}.</p>
+      <p style="margin:0;font-size:13px;color:var(--muted)">Settle this before printing real tags. If the address changes later, old tags still scan inside the app but a phone camera will open a dead link.</p>
     </div>
 
     <div class="card card-pad stack">
@@ -902,15 +1059,155 @@ function viewSetup(){
 }
 
 /* ============ overlay: new splice ============ */
+function blankSpec(){
+  return { type:SPLICE_TYPES[0], size:PIPE_SIZES[0], material:MATERIALS[0], reel:"", swage:"", insert:"",
+           fitId:"", fitSize:"", fitClass:"", fitBore:"" };
+}
+
+/* Field entry with no tag: the ID is assigned on save. */
 function openNew(){
-  state.draft = {
-    id:null, at:new Date().toISOString(), pos:null,
-    type:SPLICE_TYPES[0], size:PIPE_SIZES[0],
-    material:MATERIALS[0], reel:"", swage:"", insert:"",
-    notes:"", photos:[], dup:null
-  };
+  state.draft = Object.assign({ id:null, at:new Date().toISOString(), pos:null, notes:"", photos:[], dup:null }, blankSpec());
+  state.manualOpen = false;
   state.overlay = "new";
   render();
+}
+
+/* Field side of a prepared tag. `src` is a local record, or details decoded from the QR. */
+function openComplete(src, viaScan){
+  state.draft = {
+    id:src.id, fromTag:true, viaScan:!!viaScan, specOpen:false,
+    job: src.job || (idParts(src.id)||{}).job || "",
+    prepAt: src.prepAt || null, prepBy: src.prepBy || "", shopNotes: src.shopNotes || "",
+    at:new Date().toISOString(), pos:null,
+    type: src.type || SPLICE_TYPES[0], size: src.size || PIPE_SIZES[0],
+    material: src.material || MATERIALS[0], reel: src.reel || "", swage: src.swage || "", insert: src.insert || "",
+    fitId: src.fitId || "", fitSize: src.fitSize || "", fitClass: src.fitClass || "", fitBore: src.fitBore || "",
+    notes: src.notes || "", photos: (src.photos || []).slice(), dup:null
+  };
+  state.manualOpen = false;
+  state.overlay = "new";
+  render();
+}
+
+/* Shop side: details only, no position. */
+function openPrep(){
+  state.draft = Object.assign({ prep:true, qty:"1", shopNotes:"" }, blankSpec());
+  state.overlay = "prep";
+  render();
+}
+
+function peekId(){
+  const {job,crew} = db.settings;
+  return `${job}-${crew}-${String((db.seq[job+"-"+crew]||0)+1).padStart(4,"0")}`;
+}
+
+function specFields(d){
+  return `
+        <div class="grid2">
+          <div class="field">
+            <label for="f-type">Fitting type</label>
+            <select id="f-type" data-d="type">${SPLICE_TYPES.map(t=>`<option ${t===d.type?"selected":""}>${t}</option>`).join("")}</select>
+          </div>
+          <div class="field">
+            <label for="f-size">Pipe size</label>
+            <select id="f-size" data-d="size">${PIPE_SIZES.map(t=>`<option ${t===d.size?"selected":""}>${t}</option>`).join("")}</select>
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="f-mat">Material</label>
+            <select id="f-mat" data-d="material">${MATERIALS.map(t=>`<option ${t===d.material?"selected":""}>${t}</option>`).join("")}</select>
+          </div>
+          <div class="field">
+            <label for="f-reel">Reel number</label>
+            <input id="f-reel" class="mono-in" data-d="reel" value="${esc(d.reel)}" placeholder="R-1180">
+          </div>
+        </div>
+        ${ d.type === "Flange end" ? `
+          <div class="grid2">
+            <div class="field">
+              <label for="f-swage">Swage distance (in)</label>
+              <input id="f-swage" class="mono-in" inputmode="decimal" data-d="swage" value="${esc(d.swage)}">
+            </div>
+            <div class="field">
+              <label for="f-insert">Flange insert depth (in)</label>
+              <input id="f-insert" class="mono-in" inputmode="decimal" data-d="insert" value="${esc(d.insert)}">
+            </div>
+          </div>` : `
+          <div class="field">
+            <label for="f-swage">Swage distance (in)</label>
+            <input id="f-swage" class="mono-in" inputmode="decimal" data-d="swage" value="${esc(d.swage)}">
+          </div>` }
+
+        <div class="sect">
+          <h3 style="margin-bottom:10px;color:var(--ink-2)">${d.type === "Flange end" ? "Flange" : "Coupling"}</h3>
+          <div class="field">
+            <label for="f-fitid">Part / serial no.</label>
+            <input id="f-fitid" class="mono-in" data-d="fitId" value="${esc(d.fitId)}" placeholder="${d.type === "Flange end" ? "FL-4500-ZC-0231" : "CP-4500-SS-0118"}" autocomplete="off" autocapitalize="characters">
+          </div>
+          <div class="grid2">
+            <div class="field">
+              <label for="f-fitsize">Fitting size</label>
+              <input id="f-fitsize" class="mono-in" data-d="fitSize" value="${esc(d.fitSize)}" list="dl-fitsize" placeholder='4"' autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="f-fitclass">Pressure class</label>
+              <input id="f-fitclass" class="mono-in" data-d="fitClass" value="${esc(d.fitClass)}" list="dl-fitclass" placeholder="600#" autocomplete="off">
+            </div>
+          </div>
+          <div class="field">
+            <label for="f-fitbore">Inside diameter (in)</label>
+            <input id="f-fitbore" class="mono-in" inputmode="decimal" data-d="fitBore" value="${esc(d.fitBore)}" placeholder="3.826">
+          </div>
+          <datalist id="dl-fitsize">${FIT_SIZES.map(s=>`<option value="${esc(s)}"></option>`).join("")}</datalist>
+          <datalist id="dl-fitclass">${FIT_CLASSES.map(s=>`<option value="${esc(s)}"></option>`).join("")}</datalist>
+        </div>`;
+}
+
+function specSummary(d){
+  return `
+        <dl class="kv" style="margin-bottom:6px">
+          <dt>Type</dt><dd>${esc(d.type)}</dd>
+          <dt>Size</dt><dd>${esc(d.size)}</dd>
+          <dt>Material</dt><dd>${esc(d.material)}</dd>
+          <dt>Reel</dt><dd>${esc(d.reel)||"—"}</dd>
+          <dt>Swage dist.</dt><dd>${d.swage?esc(d.swage)+" in":"—"}</dd>
+          ${d.type==="Flange end"?`<dt>Insert depth</dt><dd>${d.insert?esc(d.insert)+" in":"—"}</dd>`:""}
+          ${fittingRows(d)}
+        </dl>
+        ${d.shopNotes?`<p style="margin:0 0 10px;font-size:14px;color:var(--ink-2)"><b>Shop notes:</b> ${esc(d.shopNotes)}</p>`:""}
+        <button type="button" class="btn sm wide" data-act="specedit">Correct shop details</button>`;
+}
+
+function viewPrep(){
+  const d = state.draft;
+  return `
+  <div class="overlay">
+    <div class="ovbar">
+      <button class="btn sm" data-act="close">Cancel</button>
+      <h2>Prepare tags</h2>
+    </div>
+    <div class="ovbody">
+      <div class="card card-pad">
+        <div class="eyebrow" style="margin-bottom:11px">Fitting details</div>
+        ${specFields(d)}
+        <div class="field">
+          <label for="p-notes">Shop notes</label>
+          <textarea id="p-notes" data-d="shopNotes" placeholder="Heat number, inspector, anything the field should know.">${esc(d.shopNotes)}</textarea>
+          <span class="hint">Stays with the record on this device. The code itself only carries the fields above, to keep it small enough to scan reliably.</span>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="p-qty">How many tags with these details</label>
+          <input id="p-qty" class="mono-in" inputmode="numeric" data-d="qty" value="${esc(d.qty)}">
+          <span class="hint">Each gets its own ID, starting at <b class="mono-in">${esc(peekId())}</b>. Everything above is copied to every tag — for unique serial numbers, create them one at a time.</span>
+        </div>
+      </div>
+    </div>
+    <div class="ovfoot">
+      <button class="btn" data-act="close">Cancel</button>
+      <button class="btn primary" data-act="prepsave">Create tags</button>
+    </div>
+  </div>`;
 }
 
 function viewNew(){
@@ -923,6 +1220,10 @@ function viewNew(){
       <h2>${d.id ? esc(d.id) : "New splice"}</h2>
     </div>
     <div class="ovbody">
+
+      ${ d.fromTag ? `<div class="notice ok" style="margin-bottom:13px">${ICON.tag}<div>
+          <b>Tag ${esc(d.id)}.</b> Shop details are already filled in — capture the position and add photos.
+        </div></div>` : "" }
 
       <div class="card card-pad gps ${g?"locked":""}" style="margin-bottom:13px">
         <div class="eyebrow" style="margin-bottom:8px">Step 1 · Position</div>
@@ -974,41 +1275,7 @@ function viewNew(){
 
       <fieldset class="card card-pad" style="margin-bottom:13px;${g?"":"opacity:.5"}" ${g?"":"disabled"}>
         <div class="eyebrow" style="margin-bottom:11px">Step 2 · The joint</div>
-        <div class="grid2">
-          <div class="field">
-            <label for="f-type">Splice type</label>
-            <select id="f-type" data-d="type">${SPLICE_TYPES.map(t=>`<option ${t===d.type?"selected":""}>${t}</option>`).join("")}</select>
-          </div>
-          <div class="field">
-            <label for="f-size">Pipe size</label>
-            <select id="f-size" data-d="size">${PIPE_SIZES.map(t=>`<option ${t===d.size?"selected":""}>${t}</option>`).join("")}</select>
-          </div>
-        </div>
-        <div class="grid2">
-          <div class="field">
-            <label for="f-mat">Material</label>
-            <select id="f-mat" data-d="material">${MATERIALS.map(t=>`<option ${t===d.material?"selected":""}>${t}</option>`).join("")}</select>
-          </div>
-          <div class="field">
-            <label for="f-reel">Reel number</label>
-            <input id="f-reel" class="mono-in" data-d="reel" value="${esc(d.reel)}" placeholder="R-1180">
-          </div>
-        </div>
-        ${ d.type === "Flange end" ? `
-          <div class="grid2">
-            <div class="field">
-              <label for="f-swage">Swage distance (in)</label>
-              <input id="f-swage" class="mono-in" inputmode="decimal" data-d="swage" value="${esc(d.swage)}">
-            </div>
-            <div class="field">
-              <label for="f-insert">Flange insert depth (in)</label>
-              <input id="f-insert" class="mono-in" inputmode="decimal" data-d="insert" value="${esc(d.insert)}">
-            </div>
-          </div>` : `
-          <div class="field">
-            <label for="f-swage">Swage distance (in)</label>
-            <input id="f-swage" class="mono-in" inputmode="decimal" data-d="swage" value="${esc(d.swage)}">
-          </div>` }
+        ${ d.fromTag && !d.specOpen ? specSummary(d) : specFields(d) }
 
         <div class="sect">
           <h3 style="margin-bottom:10px">Step 3 · Photos${d.photos.length?` · ${d.photos.length}`:""}</h3>
@@ -1027,7 +1294,7 @@ function viewNew(){
 
         <div class="sect">
           <div class="field" style="margin-bottom:0">
-            <label for="f-notes">Notes</label>
+            <label for="f-notes">${d.fromTag ? "Field notes" : "Notes"}</label>
             <textarea id="f-notes" data-d="notes" placeholder="Anything the next crew needs to know.">${esc(d.notes)}</textarea>
           </div>
         </div>
@@ -1035,7 +1302,7 @@ function viewNew(){
     </div>
     <div class="ovfoot">
       <button class="btn" data-act="cancel">Discard</button>
-      <button class="btn primary" data-act="saverec" ${g?"":"disabled"}>Save splice</button>
+      <button class="btn primary" data-act="saverec" ${g?"":"disabled"}>${d.fromTag ? "Save install" : "Save splice"}</button>
     </div>
     <input type="file" id="shotinput" accept="image/*" multiple hidden>
   </div>`;
@@ -1045,18 +1312,26 @@ function ICON_ok(){ return '<svg style="width:13px;height:13px;stroke:currentCol
 /* ============ overlay: detail ============ */
 function viewDetail(){
   const r = db.records.find(x=>x.id===state.overlay); if(!r) return "";
-  const d = state.here ? feetBetween(state.here, r.pos) : null;
+  const inst = isInstalled(r);
+  const d = inst && state.here ? feetBetween(state.here, r.pos) : null;
   const shots = (r.photos || []).filter(Boolean);
   return `
   <div class="overlay">
     <div class="ovbar">
       <button class="btn sm" data-act="close">Back</button>
       <h2 style="font-family:'IBM Plex Mono',monospace;font-size:16px">${esc(r.id)}</h2>
-      <span class="pill ${r.sync==="synced"?"ok":"warn"}">${r.sync==="synced"?"Synced":"Queued"}</span>
+      ${inst ? `<span class="pill ${r.sync==="synced"?"ok":"warn"}">${r.sync==="synced"?"Synced":"Queued"}</span>`
+             : `<span class="pill mute">Prepared</span>`}
     </div>
     <div class="ovbody stack">
 
-      <div class="card card-pad">
+      ${ inst ? "" : `<div class="card card-pad stack">
+        <div class="eyebrow">Not installed yet</div>
+        <p style="margin:0;font-size:14.5px;color:var(--ink-2)">Prepared ${r.prepAt?fmtDate(r.prepAt):""}${r.prepBy?` by ${esc(r.prepBy)}`:""}. Scanning the tag at the joint fills in the position and photos. If the tag is unreadable, you can install from here instead.</p>
+        <button class="btn primary wide" data-act="install" data-id="${esc(r.id)}">${ICON.sat} Install without scanning</button>
+      </div>` }
+
+      ${ inst ? `<div class="card card-pad">
         <div class="eyebrow" style="margin-bottom:9px">Position</div>
         <div class="row" style="align-items:flex-end;gap:12px;margin-bottom:4px">
           <div class="acc-big">${r.pos.source==="manual" ? `<small style="margin:0">Entered by hand</small>` : `±${Math.round(r.pos.acc)}<small>ft</small>`}</div>
@@ -1066,10 +1341,10 @@ function viewDetail(){
           <dt>Lat</dt><dd>${fmtCoord(r.pos.lat)}</dd>
           <dt>Lon</dt><dd>${fmtCoord(r.pos.lon)}</dd>
           <dt>Source</dt><dd>${r.pos.source==="manual" ? "Typed in" : r.pos.n+" readings averaged"}</dd>
-          <dt>Logged</dt><dd>${fmtDate(r.at)}</dd>
+          <dt>Installed</dt><dd>${fmtDate(r.at)}</dd>
         </dl>
         <button class="btn sm wide" data-copy="${r.pos.lat.toFixed(6)}, ${r.pos.lon.toFixed(6)}">Copy coordinates</button>
-      </div>
+      </div>` : "" }
 
       ${shots.length?`<div class="card card-pad">
         <div class="eyebrow" style="margin-bottom:9px">Photos · ${shots.length}</div>
@@ -1087,18 +1362,30 @@ function viewDetail(){
           <dt>Reel</dt><dd>${esc(r.reel)||"—"}</dd>
           <dt>Swage dist.</dt><dd>${r.swage?esc(r.swage)+" in":"—"}</dd>
           ${r.type==="Flange end"?`<dt>Insert depth</dt><dd>${r.insert?esc(r.insert)+" in":"—"}</dd>`:""}
-          <dt>Crew</dt><dd>${esc(r.crew)} · ${esc(r.tech)}</dd>
+          ${fittingRows(r)}
+          <dt>Job</dt><dd>${esc(jobOf(r))||"—"}</dd>
+          ${r.prepAt?`<dt>Prepared</dt><dd>${fmtDate(r.prepAt)}${r.prepBy?" · "+esc(r.prepBy):""}</dd>`:""}
+          ${inst?`<dt>Installed by</dt><dd>${esc(r.crew)}${r.tech?" · "+esc(r.tech):""}</dd>`:""}
         </dl>
-        ${r.notes?`<p style="margin:6px 0 0;font-size:14px;color:var(--ink-2);border-top:1px solid var(--line);padding-top:9px">${esc(r.notes)}</p>`:""}
+        ${r.shopNotes?`<p style="margin:6px 0 0;font-size:14px;color:var(--ink-2);border-top:1px solid var(--line);padding-top:9px"><b>Shop:</b> ${esc(r.shopNotes)}</p>`:""}
+        ${r.notes?`<p style="margin:6px 0 0;font-size:14px;color:var(--ink-2);border-top:1px solid var(--line);padding-top:9px"><b>Field:</b> ${esc(r.notes)}</p>`:""}
       </div>
 
       <div class="card card-pad stack">
         <div class="eyebrow">Tag</div>
+        <div class="tagpreview">
+          <div class="qr">${qrOrNote(tagContent(r))}</div>
+          <div class="txt">
+            <b>${esc(r.id)}</b>
+            <span>${esc(specLine(r))}</span>
+          </div>
+        </div>
         <div class="row" style="flex-wrap:wrap">
           <span class="pill ${r.tagPrinted?"ok":"mute"}">${r.tagPrinted?"Printed":"Not printed"}</span>
           <span class="pill ${r.tagApplied?"ok":"mute"}">${r.tagApplied?"On the pipe":"Not applied"}</span>
         </div>
-        ${!r.tagApplied && r.tagPrinted ? `<button class="btn sm wide" data-applied="${esc(r.id)}">Mark tag applied</button>`:""}
+        <button class="btn sm wide" data-act="printone" data-id="${esc(r.id)}">${ICON.print} ${r.tagPrinted?"Reprint this tag":"Print this tag"}</button>
+        ${!r.tagApplied && r.tagPrinted && inst ? `<button class="btn sm wide" data-applied="${esc(r.id)}">Mark tag applied</button>`:""}
       </div>
 
       <button class="btn danger wide" data-del="${esc(r.id)}">Delete record</button>
@@ -1110,20 +1397,29 @@ function viewDetail(){
 function viewCsv(){
   const ids = state.csvIds || [];
   const rows = db.records.filter(r=>ids.includes(r.id));
-  const csv = ["tag_id,job,crew,splice_type,pipe_size,install_date,latitude,longitude"]
-    .concat(rows.map(r=>[
-      r.id, db.settings.job, r.crew, r.type, r.size,
-      new Date(r.at).toISOString().slice(0,10),
-      r.pos.lat.toFixed(6), r.pos.lon.toFixed(6)
-    ].join(","))).join("\n");
+  // every field quoted: pipe sizes carry an inch mark, which breaks an unquoted CSV
+  const q = s => `"${String(s==null?"":s).replace(/"/g,'""')}"`;
+  const csv = ["tag_id,job,fitting_type,pipe_size,material,reel,swage_distance_in,flange_insert_depth_in,fitting_part_no,fitting_size,pressure_class,fitting_id_in,status,install_date,latitude,longitude,qr_content"]
+    .concat(rows.map(r=>{
+      const inst = isInstalled(r);
+      return [
+        r.id, jobOf(r), r.type, r.size, r.material, r.reel, r.swage,
+        r.type==="Flange end" ? r.insert : "",
+        r.fitId || "", r.fitSize || "", r.fitClass || "", r.fitBore || "",
+        inst ? "installed" : "prepared",
+        inst ? new Date(r.at).toISOString().slice(0,10) : "",
+        inst ? r.pos.lat.toFixed(6) : "", inst ? r.pos.lon.toFixed(6) : "",
+        tagContent(r)
+      ].map(q).join(",");
+    })).join("\n");
   return `
   <div class="overlay">
     <div class="ovbar">
       <button class="btn sm" data-act="close">Back</button>
-      <h2>Print file · ${rows.length} tag${rows.length===1?"":"s"}</h2>
+      <h2>Label file · ${rows.length} tag${rows.length===1?"":"s"}</h2>
     </div>
     <div class="ovbody stack">
-      <div class="notice ok">${ICON.check}<div>Copy this into your label software's mail-merge, or send it to a metal tag vendor. One row per tag.</div></div>
+      <div class="notice ok">${ICON.check}<div>For label software mail-merge (ZebraDesigner, P-touch Editor) or a metal tag vendor. Point the label's <b>QR code</b> object at the <span class="mono-in">qr_content</span> column — that's what makes the scan fill in the details.</div></div>
       <textarea class="csv" readonly id="csvbox">${esc(csv)}</textarea>
       <button class="btn wide" data-act="tagcsvfile">Save as file</button>
       <button class="btn sm wide" data-copy-csv="1">Copy to clipboard</button>
@@ -1133,6 +1429,195 @@ function viewCsv(){
       <button class="btn primary" data-act="markprinted">Mark ${rows.length} printed</button>
     </div>
   </div>`;
+}
+
+/* ============ overlay: printable tag sheet ============ */
+function viewPrint(){
+  const ids = state.csvIds || [];
+  const rows = db.records.filter(r=>ids.includes(r.id));
+  const libOk = typeof qrcode === "function";
+  return `
+  <div class="overlay">
+    <div class="ovbar">
+      <button class="btn sm" data-act="close">Back</button>
+      <h2>Print · ${rows.length} tag${rows.length===1?"":"s"}</h2>
+    </div>
+    <div class="ovbody stack">
+      <div class="notice ok noprint">${ICON.print}<div>Each tag is 2.6 × 1.3 in. Print at <b>100% / actual size</b> — fit-to-page shrinks the code. Easiest from a computer; on a phone use Share → Print.</div></div>
+      ${libOk ? "" : `<div class="notice bad noprint">${ICON.warn}<div>The QR library didn't load, so these tags have no code. Reload this page with signal before printing.</div></div>`}
+      <div class="sheet">
+        ${rows.map(r=>`
+          <div class="ptag">
+            <div class="qr">${qrOrNote(tagContent(r))}</div>
+            <div class="txt">
+              <b>${esc(r.id)}</b>
+              <span>${esc(r.type)} · ${esc(r.size)}</span>
+              <span>${esc(r.material)}</span>
+              ${r.swage?`<span>Swage ${esc(r.swage)} in${r.type==="Flange end"&&r.insert?` · Insert ${esc(r.insert)} in`:""}</span>`:""}
+              ${r.fitSize||r.fitClass?`<span>${r.type==="Flange end"?"Flange":"Coupling"} ${esc(r.fitSize)}${r.fitSize&&r.fitClass?" · ":""}${esc(r.fitClass)}</span>`:""}
+              ${r.fitId?`<span>No. ${esc(r.fitId)}</span>`:""}
+              <span class="brand">SPECIALTY RTP</span>
+            </div>
+          </div>`).join("")}
+      </div>
+    </div>
+    <div class="ovfoot">
+      <button class="btn" data-act="doprint">${ICON.print} Print</button>
+      <button class="btn primary" data-act="markprinted">Mark ${rows.length} printed</button>
+    </div>
+  </div>`;
+}
+
+/* ============ overlay: scanner ============ */
+function viewScan(){
+  return `
+  <div class="overlay">
+    <div class="ovbar">
+      <button class="btn sm" data-act="scanclose">Cancel</button>
+      <h2>Scan tag</h2>
+    </div>
+    <div class="ovbody stack">
+      <div class="scanbox">
+        <video id="scanvideo" playsinline muted autoplay></video>
+        <div class="scanframe"></div>
+      </div>
+      <p class="scanmsg" id="scanmsg">${state.scanErr ? "Camera off" : "Starting camera…"}</p>
+      ${state.scanErr ? `<div class="notice bad">${ICON.warn}<div>${esc(state.scanErr)}</div></div>` : ""}
+      <button class="btn wide" data-act="scanphoto">${ICON.cam} Scan from a photo</button>
+      <div class="sect">
+        <h3 style="margin-bottom:10px;color:var(--ink-2)">Or type the ID</h3>
+        <div class="field">
+          <label for="scan-id">Tag ID</label>
+          <input id="scan-id" class="mono-in" data-m="id" value="${esc(state.scanId||"")}" placeholder="J-1142-S-0001" autocomplete="off" autocapitalize="characters">
+          <span class="hint">Only finds tags prepared on this device. A code from another device has to be scanned — the details travel in the code.</span>
+        </div>
+        <button class="btn sm wide" data-act="scanid">Open</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+let scanStream = null, scanTimer = null, scanCanvas = null;
+
+function stopScanner(){
+  if(scanTimer){ clearTimeout(scanTimer); scanTimer = null; }
+  if(scanStream){ try{ scanStream.getTracks().forEach(t=>t.stop()); }catch(e){} scanStream = null; }
+}
+
+function scanFail(msg){
+  stopScanner();
+  state.scanErr = msg;
+  render();                       // only re-render after the camera is released
+}
+
+async function startScanner(){
+  stopScanner();
+  const msg = $("#scanmsg");
+  if(typeof jsQR !== "function"){
+    return scanFail("The scanner didn't load. Open this page once with signal, keep the tab open, then scan. Typing the ID still works.");
+  }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    return scanFail("This browser can't open the camera here. Use Scan from a photo instead.");
+  }
+  try{
+    // ask for HD: the tag is small in frame, and the decoder needs ~4 px per QR square
+    scanStream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1920 }, height:{ ideal:1080 } }, audio:false });
+  }catch(err){
+    const denied = err && (err.name === "NotAllowedError" || err.name === "SecurityError");
+    return scanFail(denied
+      ? "Camera permission was denied. Allow it for this site in your browser settings, or use Scan from a photo."
+      : "Couldn't start the camera. Use Scan from a photo instead.");
+  }
+  const v = $("#scanvideo");
+  if(!v || state.overlay !== "scan"){ stopScanner(); return; }
+  v.srcObject = scanStream;
+  try{ await v.play(); }catch(e){}
+  if(msg) msg.textContent = "Point the camera at the code on the tag.";
+  scanTick();
+}
+
+function scanTick(){
+  scanTimer = null;
+  if(!scanStream || state.overlay !== "scan") return;
+  const v = $("#scanvideo");
+  if(v && v.readyState >= 2 && v.videoWidth){
+    const vw = v.videoWidth, vh = v.videoHeight;
+    const c = scanCanvas || (scanCanvas = document.createElement("canvas"));
+    const g = c.getContext("2d", { willReadFrequently:true });
+    let w, h;
+    // Alternate two views. Most frames: the centre square (where the on-screen frame is)
+    // at full sensor resolution, so a small tag still gets enough pixels. Every third
+    // frame: the whole picture shrunk down, for a tag held close or off-centre.
+    scanTick.n = (scanTick.n || 0) + 1;
+    if(scanTick.n % 3){
+      // 1:1 when possible — even a slight shrink blurs square edges enough to fail a dense code
+      const side = Math.round(Math.min(vw, vh) * 0.72);
+      w = h = Math.min(side, 1100);
+      c.width = w; c.height = h;
+      g.drawImage(v, (vw - side)/2, (vh - side)/2, side, side, 0, 0, w, h);
+    }else{
+      w = Math.min(800, vw); h = Math.round(vh * w / vw);
+      c.width = w; c.height = h;
+      g.drawImage(v, 0, 0, w, h);
+    }
+    // attemptBoth: laser-marked stainless often reads light-on-dark
+    const code = jsQR(g.getImageData(0,0,w,h).data, w, h, { inversionAttempts:"attemptBoth" });
+    if(code && code.data){
+      stopScanner();
+      if(navigator.vibrate) try{ navigator.vibrate(60); }catch(e){}
+      handleTag(code.data);
+      return;
+    }
+  }
+  scanTimer = setTimeout(scanTick, 140);
+}
+
+/* Decode a still photo, trying a few sizes since the code may be small in the frame. */
+async function decodePhoto(file){
+  const url = URL.createObjectURL(file);
+  try{
+    const img = await new Promise((res,rej)=>{
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error("Could not read that image."));
+      i.src = url;
+    });
+    for(const max of [1200, 800, 1800]){
+      const s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.round(img.naturalWidth*s), h = Math.round(img.naturalHeight*s);
+      const c = document.createElement("canvas"); c.width = w; c.height = h;
+      const g = c.getContext("2d", { willReadFrequently:true });
+      g.drawImage(img, 0, 0, w, h);
+      const code = jsQR(g.getImageData(0,0,w,h).data, w, h, { inversionAttempts:"attemptBoth" });
+      if(code && code.data) return code.data;
+    }
+    return null;
+  }finally{ URL.revokeObjectURL(url); }
+}
+
+/* One entry point for every way a tag arrives: camera, photo, typed ID, or a phone-camera link. */
+function handleTag(text){
+  const tag = parseTag(text);
+  const inScanner = state.overlay === "scan";
+  // a wrong code shouldn't throw the crew out of the scanner: say so, then keep looking
+  const retry = msg => {
+    toast(msg);
+    if(inScanner) setTimeout(()=>{ if(state.overlay === "scan" && !scanStream) startScanner(); }, 1400);
+    else { state.overlay = null; render(); }
+  };
+  if(!tag) return retry("That code isn't a splice tag");
+
+  const local = db.records.find(r=>r.id===tag.id);
+  if(!local && tag.bare) return retry(`No record for ${tag.id} on this device — scan the tag's code`);
+
+  state.scanErr = null; state.scanId = "";
+  if(local && isInstalled(local)){
+    state.overlay = local.id; render();
+    toast(`${local.id} is already installed`);
+    return;
+  }
+  openComplete(local || tag, true);   // no local record: the details came in the code itself
 }
 
 /* ============ export ============ */
@@ -1207,7 +1692,7 @@ function posLine(r){
 /* KML. withPhotos=true writes relative paths that only resolve inside a KMZ. */
 function buildKml(withPhotos){
   const job = db.settings.job || "Splice log";
-  const marks = db.records.map(r => {
+  const marks = db.records.filter(isInstalled).map(r => {
     const shots = (r.photos || []).filter(Boolean);
     const imgs = withPhotos
       ? shots.map((p,i)=>`<img src="files/${r.id}-${i+1}.jpg" width="380"/><br/>`).join("")
@@ -1220,10 +1705,16 @@ function buildKml(withPhotos){
       `<b>Swage distance:</b> ${r.swage ? xml(r.swage) + " in" : "—"}<br/>` +
       (r.type === "Flange end"
         ? `<b>Flange insert depth:</b> ${r.insert ? xml(r.insert) + " in" : "—"}<br/>` : "") +
-      `<b>Logged:</b> ${xml(fmtDate(r.at))}<br/>` +
+      (r.fitId || r.fitSize || r.fitClass || r.fitBore
+        ? `<b>${r.type === "Flange end" ? "Flange" : "Coupling"}:</b> ` +
+          [r.fitId && "No. " + xml(r.fitId), xml(r.fitSize), xml(r.fitClass),
+           r.fitBore && "ID " + xml(r.fitBore) + " in"].filter(Boolean).join(" · ") + `<br/>` : "") +
+      (r.prepAt ? `<b>Prepared:</b> ${xml(fmtDate(r.prepAt))}${r.prepBy ? " · " + xml(r.prepBy) : ""}<br/>` : "") +
+      `<b>Installed:</b> ${xml(fmtDate(r.at))}<br/>` +
       `<b>Crew:</b> ${xml(r.crew)}${r.tech ? " · " + xml(r.tech) : ""}<br/>` +
       `<b>Position:</b> ${xml(posLine(r))}<br/>` +
-      (r.notes ? `<b>Notes:</b> ${xml(r.notes)}<br/>` : "") +
+      (r.shopNotes ? `<b>Shop notes:</b> ${xml(r.shopNotes)}<br/>` : "") +
+      (r.notes ? `<b>Field notes:</b> ${xml(r.notes)}<br/>` : "") +
       (shots.length ? `<br/>${imgs}` : "");
     return `  <Placemark>
     <name>${xml(r.id)}</name>
@@ -1247,16 +1738,25 @@ ${marks}
 }
 
 function buildCsv(){
-  const head = "record_id,job,crew,technician,type,pipe_size,material,reel,swage_distance_in,flange_insert_depth_in,logged_utc,latitude,longitude,position_source,accuracy_ft,readings,photo_count,datum,notes";
+  const head = "record_id,job,status,crew,technician,fitting_type,pipe_size,material,reel,swage_distance_in,flange_insert_depth_in,fitting_part_no,fitting_size,pressure_class,fitting_id_in,prepared_utc,prepared_by,installed_utc,latitude,longitude,position_source,accuracy_ft,readings,photo_count,datum,shop_notes,field_notes";
   const q = s => `"${String(s==null?"":s).replace(/"/g,'""')}"`;
-  const rows = db.records.map(r => [
-    r.id, db.settings.job, r.crew, r.tech, r.type, r.size, r.material, r.reel,
-    r.swage, r.type==="Flange end" ? r.insert : "",
-    r.at, r.pos.lat.toFixed(7), r.pos.lon.toFixed(7),
-    r.pos.source === "manual" ? "manual" : "device_gps",
-    r.pos.source === "manual" ? "" : Math.round(r.pos.acc),
-    r.pos.n, (r.photos||[]).length, "WGS84", r.notes
-  ].map(q).join(","));
+  const rows = db.records.map(r => {
+    const p = r.pos;
+    return [
+      r.id, jobOf(r), p ? "installed" : "prepared",
+      p ? r.crew : "", p ? r.tech : "",
+      r.type, r.size, r.material, r.reel,
+      r.swage, r.type==="Flange end" ? r.insert : "",
+      r.fitId || "", r.fitSize || "", r.fitClass || "", r.fitBore || "",
+      r.prepAt || "", r.prepBy || "",
+      p ? r.at : "",
+      p ? p.lat.toFixed(7) : "", p ? p.lon.toFixed(7) : "",
+      p ? (p.source === "manual" ? "manual" : "device_gps") : "",
+      p && p.source !== "manual" ? Math.round(p.acc) : "",
+      p ? p.n : "", (r.photos||[]).length, p ? "WGS84" : "",
+      r.shopNotes || "", r.notes || ""
+    ].map(q).join(",");
+  });
   return [head].concat(rows).join("\n");
 }
 
@@ -1290,7 +1790,7 @@ function baseName(){ return (db.settings.job || "splice-log").replace(/[^A-Za-z0
 async function exportKmz(){
   const enc = new TextEncoder();
   const files = [{name:"doc.kml", data:enc.encode(buildKml(true))}];
-  db.records.forEach(r => {
+  db.records.filter(isInstalled).forEach(r => {
     (r.photos || []).filter(Boolean).forEach((p,i) => {
       try{ files.push({name:`files/${r.id}-${i+1}.jpg`, data:dataUriToBytes(p)}); }catch(e){}
     });
@@ -1336,15 +1836,34 @@ function render(){
     : state.tab==="export" ? viewExport()
     : viewSetup();
 
+  // re-rendering replaces the <video>, so the camera must never outlive the scanner screen
+  if(state.overlay !== "scan") stopScanner();
+
   const root = $("#overlay-root");
   root.innerHTML = state.overlay==="new" ? viewNew()
-    : state.overlay==="csv" ? viewCsv()
+    : state.overlay==="prep"  ? viewPrep()
+    : state.overlay==="csv"   ? viewCsv()
+    : state.overlay==="print" ? viewPrint()
+    : state.overlay==="scan"  ? viewScan()
     : state.overlay ? viewDetail() : "";
   $("#ask-root").innerHTML = state.ask ? viewAsk() : "";
   document.body.style.overflow = (state.overlay || state.ask) ? "hidden" : "";
 
-  if(state.tab==="log" && db.records.length) requestAnimationFrame(drawPlot);
-  const q = $("#qrprev"); if(q) drawQrStub(q, db.records.find(r=>!r.tagPrinted).id);
+  if(state.tab==="log" && db.records.some(isInstalled)) requestAnimationFrame(drawPlot);
+
+  // something re-rendered mid-scan (a theme change, say): hand the live camera to the new <video>
+  if(state.overlay === "scan" && scanStream){
+    const v = $("#scanvideo");
+    if(v){ v.srcObject = scanStream; const p = v.play(); if(p && p.catch) p.catch(()=>{}); }
+    const m = $("#scanmsg"); if(m) m.textContent = "Point the camera at the code on the tag.";
+  }
+}
+
+function openScanner(){
+  state.scanErr = null;
+  state.overlay = "scan";
+  render();
+  startScanner();
 }
 
 
@@ -1386,6 +1905,87 @@ document.addEventListener("click", async e => {
   const act = t.dataset.act;
 
   if(act==="new"){ openNew(); return; }
+
+  /* ---- scanning ---- */
+  if(act==="scan"){ openScanner(); return; }
+  if(act==="scanclose"){ stopScanner(); state.overlay = null; state.scanErr = null; render(); return; }
+  if(act==="scanphoto"){
+    const inp = $("#scanphotoinput");
+    inp.value = "";
+    inp.onchange = async () => {
+      const f = inp.files && inp.files[0]; if(!f) return;
+      if(typeof jsQR !== "function"){ toast("Scanner didn't load — reload with signal"); return; }
+      stopScanner();
+      const m = $("#scanmsg"); if(m) m.textContent = "Reading photo…";
+      let text = null;
+      try{ text = await decodePhoto(f); }catch(err){ toast(err.message); }
+      if(text) handleTag(text);
+      else{
+        toast("No code found in that photo — get closer and fill the frame");
+        if(state.overlay === "scan") startScanner();
+      }
+    };
+    inp.click();
+    return;
+  }
+  if(act==="scanid"){
+    const id = (state.scanId||"").trim().toUpperCase();
+    if(!id){ toast("Type a tag ID first"); return; }
+    if(!db.records.some(r=>r.id.toUpperCase()===id)){
+      toast(`No record for ${id} on this device`); return;
+    }
+    stopScanner();
+    handleTag(db.records.find(r=>r.id.toUpperCase()===id).id);
+    return;
+  }
+
+  /* ---- shop prep ---- */
+  if(act==="prep"){ openPrep(); return; }
+  if(act==="prepsave"){
+    const d = state.draft;
+    if(!db.settings.job){ toast("Set a job number in Setup first"); return; }
+    const qty = Math.max(1, Math.min(50, parseInt(d.qty,10) || 1));
+    const now = new Date().toISOString();
+    let first = null;
+    for(let i=0;i<qty;i++){
+      const rec = {
+        id: nextId(), job: db.settings.job, prepAt: now, prepBy: db.settings.tech, at: now, pos:null,
+        type:d.type, size:d.size, material:d.material, reel:d.reel, swage:d.swage,
+        insert: d.type==="Flange end" ? d.insert : "",
+        fitId:d.fitId||"", fitSize:d.fitSize||"", fitClass:d.fitClass||"", fitBore:d.fitBore||"",
+        shopNotes: d.shopNotes || "", notes:"", photos:[],
+        crew: db.settings.crew, tech: db.settings.tech,
+        sync:"pending", tagPrinted:null, tagApplied:null
+      };
+      db.records.push(rec);
+      if(!first) first = rec.id;
+    }
+    save();
+    state.draft = null; state.overlay = null; state.tab = "tags";
+    render();
+    toast(qty === 1 ? `${first} ready to print` : `${qty} tags ready to print`);
+    return;
+  }
+  if(act==="specedit"){ state.draft.specOpen = true; render(); return; }
+  if(act==="install"){
+    const r = db.records.find(x=>x.id===t.dataset.id);
+    if(r) openComplete(r, false);
+    return;
+  }
+
+  /* ---- printing ---- */
+  if(act==="printsheet"){
+    const ids = [...document.querySelectorAll(".tagpick:checked")].map(b=>b.value);
+    if(!ids.length){ toast("Pick at least one tag"); return; }
+    state.csvIds = ids; state.overlay = "print"; render();
+    return;
+  }
+  if(act==="printone"){ state.csvIds = [t.dataset.id]; state.overlay = "print"; render(); return; }
+  if(act==="doprint"){
+    try{ window.print(); }catch(err){ toast("Printing is blocked here — open the site in Safari or Chrome"); }
+    return;
+  }
+
   if(act==="addshot"){
     const inp = $("#shotinput");
     inp.value = "";
@@ -1529,17 +2129,42 @@ document.addEventListener("click", async e => {
   if(act==="saverec"){
     const d = state.draft;
     if(!d.pos){ toast("Capture a position first"); return; }
-    const rec = Object.assign({}, d, {
-      id: nextId(),
-      at: new Date().toISOString(),
-      crew: db.settings.crew, tech: db.settings.tech,
-      sync:"pending", tagPrinted:null, tagApplied:null
-    });
-    delete rec.dup;
-    db.records.push(rec);
+    const now = new Date().toISOString();
+    const fields = {
+      type:d.type, size:d.size, material:d.material, reel:d.reel, swage:d.swage,
+      insert: d.type==="Flange end" ? d.insert : "",
+      fitId:d.fitId||"", fitSize:d.fitSize||"", fitClass:d.fitClass||"", fitBore:d.fitBore||"",
+      notes:d.notes, photos:d.photos, pos:d.pos
+    };
+    let rec;
+    if(d.fromTag){
+      // keep the tag's ID and shop history; this device may never have seen it before
+      const idx = db.records.findIndex(x=>x.id===d.id);
+      const prev = idx > -1 ? db.records[idx] : {};
+      rec = Object.assign({}, prev, fields, {
+        id: d.id,
+        job: prev.job || d.job,
+        prepAt: prev.prepAt || d.prepAt || null,
+        prepBy: prev.prepBy || d.prepBy || "",
+        shopNotes: prev.shopNotes || d.shopNotes || "",
+        at: now, crew: db.settings.crew, tech: db.settings.tech, sync:"pending",
+        // a scan proves the tag exists and is on the joint; installing by hand proves neither
+        tagPrinted: prev.tagPrinted || (d.viaScan ? now : null),
+        tagApplied: d.viaScan ? now : (prev.tagApplied || null)
+      });
+      if(idx > -1) db.records[idx] = rec; else db.records.push(rec);
+      bumpSeq(rec.id);
+    }else{
+      rec = Object.assign(fields, {
+        id: nextId(), job: db.settings.job, at: now,
+        crew: db.settings.crew, tech: db.settings.tech,
+        sync:"pending", tagPrinted:null, tagApplied:null
+      });
+      db.records.push(rec);
+    }
     save();
     state.draft = null; state.overlay = null;
-    render(); toast(rec.id + " saved");
+    render(); toast(rec.id + (d.fromTag ? " installed" : " saved"));
     return;
   }
 
@@ -1564,8 +2189,10 @@ document.addEventListener("click", async e => {
 });
 
 function nearestDup(pos){
+  const self = state.draft && state.draft.id;
   let best = null;
   db.records.forEach(r=>{
+    if(!r.pos || r.id === self) return;
     const ft = feetBetween(pos, r.pos);
     if(ft <= DUP_FT && (!best || ft < best.ft)) best = {id:r.id, ft};
   });
@@ -1576,12 +2203,18 @@ document.addEventListener("input", e => {
   const t = e.target;
   if(t.dataset.d && state.draft){ state.draft[t.dataset.d] = t.value; return; }
   if(t.dataset.m){
-    if(t.dataset.m === "lat") state.manualLat = t.value; else state.manualLon = t.value;
+    const m = t.dataset.m;
+    if(m === "lat") state.manualLat = t.value;
+    else if(m === "lon") state.manualLon = t.value;
+    else if(m === "id") state.scanId = t.value;
     return;
   }
   if(t.dataset.set){
     const k = t.dataset.set, v = t.value.trim();
-    db.settings[k] = (k === "crew") ? (v.toUpperCase() || "A") : v;
+    // job and crew become part of IDs, file names, and QR codes: keep them to safe characters
+    db.settings[k] = k === "crew" ? (v.toUpperCase().replace(/[^A-Z0-9]/g,"") || "A")
+                   : k === "job"  ? v.replace(/[^A-Za-z0-9._-]+/g,"-")
+                   : v;
     save(); renderStatuses();
   }
 });
@@ -1596,7 +2229,23 @@ window.addEventListener("offline", renderStatuses);
 window.addEventListener("resize", () => { if(state.tab==="log") drawPlot(); });
 if(window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => setTimeout(render, 30));
 
+/* A phone's own camera opens the tag link; the payload sits in the #fragment,
+   which never leaves the phone. Clear it so a reload doesn't re-open the tag. */
+function checkLinkedTag(){
+  if(!/(?:^#|[#&])t=/.test(location.hash)) return;
+  const text = location.hash;
+  try{ history.replaceState(null, "", location.pathname + location.search); }catch(e){}
+  handleTag(text);
+}
+window.addEventListener("hashchange", checkLinkedTag);
+// release the camera when the app is backgrounded
+document.addEventListener("visibilitychange", () => {
+  if(document.hidden && scanStream){ stopScanner(); }
+  else if(!document.hidden && state.overlay === "scan" && !scanStream && !state.scanErr){ startScanner(); }
+});
+
 /* ============ boot ============ */
 render();
+checkLinkedTag();
 startWatch();
 </script>
